@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>End-to-End Encryption Demo</title>
+  <style>
+    body { max-width: 800px; margin: 40px auto; padding: 0 16px; font-family: monospace; }
+    #log { border: 1px solid #ccc; padding: 12px; height: 420px; overflow-y: auto; background: #f9f9f9; }
+    .log-entry { margin: 2px 0; }
+    .log-entry.step    { color: #000; }
+    .log-entry.ok      { color: #007700; }
+    .log-entry.error   { color: #cc0000; font-weight: bold; }
+    .log-entry.data    { color: #555; padding-left: 16px; }
+    .log-entry.heading { color: #000; font-weight: bold; border-top: 1px solid #ccc; margin-top: 8px; padding-top: 6px; }
+    #public-key-display { border: 1px solid #ccc; padding: 8px; white-space: pre-wrap; word-break: break-all;
+                          background: #f0f0f0; font-size: 11px; max-height: 160px; overflow-y: auto; }
+    fieldset { margin-top: 16px; }
+    button { margin-top: 8px; }
+    #status { margin-top: 12px; font-weight: bold; }
+    #result { margin-top: 12px; border: 1px solid #aaa; padding: 10px; background: #e8ffe8; display: none; }
+  </style>
+</head>
+<body>
+
+<h1>End-to-End Encryption Demo</h1>
+<p>
+  This page demonstrates hybrid asymmetric encryption: the browser encrypts a file
+  using the server's RSA public key so that only the server's private key can decrypt it.
+  No plaintext data is ever sent over the wire.
+</p>
+
+<fieldset>
+  <legend>Server RSA-2048 Public Key (fetched on load)</legend>
+  <div id="public-key-display">Waiting for public key…</div>
+</fieldset>
+
+<fieldset>
+  <legend>Upload a file</legend>
+  <input type="file" id="file-input" />
+  <br />
+  <button id="upload-btn" disabled>Encrypt &amp; Upload</button>
+</fieldset>
+
+<div id="status"></div>
+<div id="result"></div>
+
+<h2>Process Log</h2>
+<div id="log"></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Logging helpers
+// ---------------------------------------------------------------------------
+const logEl = document.getElementById('log');
+
+function log(msg, type = 'step') {
+  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const div = document.createElement('div');
+  div.className = `log-entry ${type}`;
+  div.textContent = `[${ts}] ${msg}`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function logHeading(msg) { log(msg, 'heading'); }
+function logOk(msg)      { log('✓ ' + msg, 'ok'); }
+function logError(msg)   { log('✗ ' + msg, 'error'); }
+function logData(msg)    { log('  ' + msg, 'data'); }
+
+// ---------------------------------------------------------------------------
+// Utility: arraybuffer → base64
+// ---------------------------------------------------------------------------
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function bufferToHex(buffer) {
+  return Array.from(new Uint8Array(buffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1048576).toFixed(2)} MB`;
+}
+
+// ---------------------------------------------------------------------------
+// Convert PEM → ArrayBuffer (strip headers, base64-decode)
+// ---------------------------------------------------------------------------
+function pemToArrayBuffer(pem) {
+  const b64 = pem
+    .replace(/-----BEGIN PUBLIC KEY-----/, '')
+    .replace(/-----END PUBLIC KEY-----/, '')
+    .replace(/\s+/g, '');
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let rsaPublicKey = null; // CryptoKey (imported from server)
+
+// ---------------------------------------------------------------------------
+// Step 1: Fetch and import the server's public key on page load
+// ---------------------------------------------------------------------------
+async function initPublicKey() {
+  logHeading('PHASE 1 — Fetch & import the server\'s RSA public key');
+
+  log('Sending GET /api/public-key to fetch the server\'s RSA-2048 public key (SPKI/PEM format)…');
+  let pemKey;
+  try {
+    const res = await fetch('/api/public-key');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    pemKey = data.publicKey;
+    logOk(`Public key received (${pemKey.length} characters of PEM text).`);
+  } catch (err) {
+    logError(`Failed to fetch public key: ${err.message}`);
+    return;
+  }
+
+  // Display the raw PEM for inspection
+  document.getElementById('public-key-display').textContent = pemKey;
+
+  log('Stripping PEM headers and base64-decoding to obtain raw SPKI-encoded DER bytes…');
+  const spkiDer = pemToArrayBuffer(pemKey);
+  logData(`SPKI DER bytes: ${spkiDer.byteLength} bytes`);
+
+  log('Importing key into WebCrypto API as RSA-OAEP / SHA-256 public key (SubtleCrypto.importKey)…');
+  try {
+    rsaPublicKey = await crypto.subtle.importKey(
+      'spki',
+      spkiDer,
+      { name: 'RSA-OAEP', hash: 'SHA-256' },
+      /* extractable = */ false,
+      ['encrypt']
+    );
+    logOk('RSA-2048 public key imported successfully into WebCrypto. Ready to encrypt.');
+    document.getElementById('upload-btn').disabled = false;
+    document.getElementById('status').textContent = 'Ready — select a file and click "Encrypt & Upload".';
+  } catch (err) {
+    logError(`Key import failed: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Encrypt and upload on button click
+// ---------------------------------------------------------------------------
+async function encryptAndUpload() {
+  const fileInput = document.getElementById('file-input');
+  const statusEl = document.getElementById('status');
+  const resultEl = document.getElementById('result');
+  const btn = document.getElementById('upload-btn');
+
+  resultEl.style.display = 'none';
+
+  if (!fileInput.files || fileInput.files.length === 0) {
+    alert('Please select a file first.');
+    return;
+  }
+  if (!rsaPublicKey) {
+    logError('RSA public key not available. Cannot encrypt.');
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = 'Working…';
+
+  const file = fileInput.files[0];
+
+  // ─── Phase 2: Read file ──────────────────────────────────────────────────
+  logHeading('PHASE 2 — Read the selected file into memory');
+  log(`File selected: "${file.name}" (${formatBytes(file.size)}, type: "${file.type || 'unknown'}")`);
+  log('Reading file as ArrayBuffer via FileReader API…');
+
+  let fileBuffer;
+  try {
+    fileBuffer = await file.arrayBuffer();
+    logOk(`File read into memory: ${fileBuffer.byteLength} bytes of raw data.`);
+    logData(`First 16 bytes (hex): ${bufferToHex(fileBuffer.slice(0, 16))}${fileBuffer.byteLength > 16 ? '…' : ''}`);
+  } catch (err) {
+    logError(`Failed to read file: ${err.message}`);
+    btn.disabled = false;
+    return;
+  }
+
+  // ─── Phase 3: Generate AES session key ──────────────────────────────────
+  logHeading('PHASE 3 — Generate a one-time AES-256-GCM session key');
+  log('Why a session key? RSA can only encrypt small payloads (≤214 bytes for RSA-2048/SHA-256).');
+  log('Instead we encrypt the file with fast symmetric AES-256, then RSA-encrypt only the AES key.');
+  log('This is called hybrid encryption and is the standard approach used in TLS, PGP, etc.');
+  log('Generating a cryptographically random 256-bit (32-byte) AES-GCM key via SubtleCrypto.generateKey…');
+
+  let aesKey;
+  try {
+    aesKey = await crypto.subtle.generateKey(
+      { name: 'AES-GCM', length: 256 },
+      /* extractable = */ true,
+      ['encrypt', 'decrypt']
+    );
+    logOk('AES-256-GCM session key generated.');
+    logData('Key is marked extractable so we can export the raw bytes for RSA encryption.');
+  } catch (err) {
+    logError(`AES key generation failed: ${err.message}`);
+    btn.disabled = false;
+    return;
+  }
+
+  // ─── Phase 4: Generate IV ────────────────────────────────────────────────
+  logHeading('PHASE 4 — Generate a random Initialisation Vector (IV) for AES-GCM');
+  log('GCM mode requires a unique nonce (IV) per encryption. NIST recommends 96 bits (12 bytes).');
+  log('Generating 12 cryptographically random bytes via crypto.getRandomValues…');
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  logOk(`IV generated: ${bufferToHex(iv)} (${iv.byteLength} bytes)`);
+  logData('IMPORTANT: The same IV must never be reused with the same key — here it is generated fresh every time.');
+
+  // ─── Phase 5: Encrypt the file with AES-GCM ─────────────────────────────
+  logHeading('PHASE 5 — Encrypt the file with AES-256-GCM');
+  log('Calling SubtleCrypto.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuffer)…');
+  log('AES-GCM provides both confidentiality (via AES in counter mode) and integrity (via GHASH authentication tag).');
+
+  let encryptedFileBuffer;
+  try {
+    encryptedFileBuffer = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      aesKey,
+      fileBuffer
+    );
+    const tagBytes = 16; // GCM auth tag is always 16 bytes in WebCrypto
+    logOk(`File encrypted: ${fileBuffer.byteLength} bytes → ${encryptedFileBuffer.byteLength} bytes.`);
+    logData(`Ciphertext: ${encryptedFileBuffer.byteLength - tagBytes} bytes`);
+    logData(`GCM authentication tag (appended): ${tagBytes} bytes`);
+    logData('The auth tag ensures the server can detect any tampering with the ciphertext.');
+  } catch (err) {
+    logError(`File encryption failed: ${err.message}`);
+    btn.disabled = false;
+    return;
+  }
+
+  // ─── Phase 6: Export the AES key ────────────────────────────────────────
+  logHeading('PHASE 6 — Export the AES session key as raw bytes');
+  log('To send the AES key to the server securely we first export it as raw bytes,');
+  log('then encrypt those bytes with RSA so only the server\'s private key can recover them.');
+  log('Calling SubtleCrypto.exportKey("raw", aesKey)…');
+
+  let rawAesKeyBuffer;
+  try {
+    rawAesKeyBuffer = await crypto.subtle.exportKey('raw', aesKey);
+    logOk(`AES key exported: ${rawAesKeyBuffer.byteLength} bytes (${rawAesKeyBuffer.byteLength * 8} bits).`);
+    logData(`Key bytes (hex): ${bufferToHex(rawAesKeyBuffer)}`);
+    logData('NOTE: These bytes exist only in memory and are immediately RSA-encrypted below.');
+  } catch (err) {
+    logError(`AES key export failed: ${err.message}`);
+    btn.disabled = false;
+    return;
+  }
+
+  // ─── Phase 7: Encrypt the AES key with RSA-OAEP ─────────────────────────
+  logHeading('PHASE 7 — Encrypt the AES session key with the server\'s RSA-2048 public key');
+  log('Using RSA-OAEP (Optimal Asymmetric Encryption Padding) with SHA-256.');
+  log('OAEP is probabilistic: encrypting the same key twice produces different ciphertexts.');
+  log('Calling SubtleCrypto.encrypt({ name: "RSA-OAEP" }, rsaPublicKey, rawAesKeyBuffer)…');
+
+  let encryptedAesKeyBuffer;
+  try {
+    encryptedAesKeyBuffer = await crypto.subtle.encrypt(
+      { name: 'RSA-OAEP' },
+      rsaPublicKey,
+      rawAesKeyBuffer
+    );
+    logOk(`AES key RSA-encrypted: ${rawAesKeyBuffer.byteLength} bytes → ${encryptedAesKeyBuffer.byteLength} bytes.`);
+    logData(`RSA-2048 always produces a fixed-size output of 256 bytes (= modulus size).`);
+    logData(`Encrypted key (base64): ${bufferToBase64(encryptedAesKeyBuffer).slice(0, 48)}…`);
+  } catch (err) {
+    logError(`RSA encryption of AES key failed: ${err.message}`);
+    btn.disabled = false;
+    return;
+  }
+
+  // ─── Phase 8: Encode and assemble payload ───────────────────────────────
+  logHeading('PHASE 8 — Encode payload as Base64 JSON for HTTP transmission');
+  log('Binary buffers cannot be sent as JSON directly. Encoding each field as Base64…');
+
+  const encryptedAesKeyB64  = bufferToBase64(encryptedAesKeyBuffer);
+  const encryptedFileB64    = bufferToBase64(encryptedFileBuffer);
+  const ivB64               = bufferToBase64(iv);
+
+  logData(`encryptedAesKey  (base64): ${encryptedAesKeyB64.length} chars`);
+  logData(`encryptedFile    (base64): ${encryptedFileB64.length} chars  ← contains ciphertext + GCM tag`);
+  logData(`iv               (base64): ${ivB64.length} chars`);
+  logData(`filename: "${file.name}"`);
+
+  const payload = {
+    encryptedAesKey:  encryptedAesKeyB64,
+    encryptedFile:    encryptedFileB64,
+    iv:               ivB64,
+    filename:         file.name,
+  };
+
+  const payloadJson = JSON.stringify(payload);
+  logOk(`JSON payload assembled: ${formatBytes(payloadJson.length)} total.`);
+  log('The payload contains ONLY encrypted data. The server cannot read any of it without its private key.');
+
+  // ─── Phase 9: Send to server ─────────────────────────────────────────────
+  logHeading('PHASE 9 — Send encrypted payload to the server');
+  log('Sending HTTP POST /api/upload with Content-Type: application/json…');
+
+  let responseData;
+  try {
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payloadJson,
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(`HTTP ${res.status}: ${errJson.error || res.statusText}`);
+    }
+
+    responseData = await res.json();
+    logOk(`Server responded 200 OK.`);
+  } catch (err) {
+    logError(`Upload failed: ${err.message}`);
+    statusEl.textContent = 'Error — see log above.';
+    btn.disabled = false;
+    return;
+  }
+
+  // ─── Phase 10: Done ──────────────────────────────────────────────────────
+  logHeading('PHASE 10 — Server confirmed successful decryption & storage');
+  log('The server used its RSA private key to decrypt the AES session key,');
+  log('then used that AES key to decrypt the file ciphertext and verify the GCM auth tag.');
+  logOk(`File stored on server: "${responseData.filename}" (${formatBytes(responseData.decryptedBytes)} decrypted)`);
+  logOk('End-to-end encryption demo complete. The plaintext file was never transmitted over the wire.');
+
+  resultEl.style.display = 'block';
+  resultEl.innerHTML =
+    `<strong>Upload successful!</strong><br>` +
+    `File <code>${responseData.filename}</code> (${formatBytes(responseData.decryptedBytes)}) ` +
+    `was encrypted in the browser, transmitted as ciphertext, and decrypted server-side.`;
+
+  statusEl.textContent = 'Done.';
+  btn.disabled = false;
+}
+
+// ---------------------------------------------------------------------------
+// Wire up events
+// ---------------------------------------------------------------------------
+document.getElementById('upload-btn').addEventListener('click', encryptAndUpload);
+
+// Kick off key fetch immediately
+initPublicKey();
+</script>
+
+</body>
+</html>

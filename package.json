@@ -1,0 +1,12 @@
+{
+  "name": "encrypted-transfer",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=packages/backend",
+    "build": "npm run build --workspace=packages/backend",
+    "start": "npm run start --workspace=packages/backend"
+  }
+}
