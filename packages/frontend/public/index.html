@@ -19,9 +19,16 @@
     button { margin-top: 8px; }
     #status { margin-top: 12px; font-weight: bold; }
     #result { margin-top: 12px; border: 1px solid #aaa; padding: 10px; background: #e8ffe8; display: none; }
+  nav { margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid #ccc; }
+  nav a { margin-right: 16px; color: #0055aa; }
   </style>
 </head>
 <body>
+
+<nav>
+  <a href="/"><strong>Upload</strong></a>
+  <a href="/about.html">About</a>
+</nav>
 
 <h1>End-to-End Encryption Demo</h1>
 <p>
@@ -114,6 +121,17 @@ let rsaPublicKey = null; // CryptoKey (imported from server)
 // ---------------------------------------------------------------------------
 async function initPublicKey() {
   logHeading('PHASE 1 — Fetch & import the server\'s RSA public key');
+
+  if (!crypto.subtle) {
+    logError('WebCrypto SubtleCrypto API is unavailable.');
+    logData('crypto.subtle is only accessible in secure contexts:');
+    logData('  • https:// (any host)');
+    logData('  • http://localhost  (exactly — not an IP address)');
+    logData(`Current origin: ${location.origin}`);
+    logData('Fix: open http://localhost:3000 instead of using an IP address.');
+    document.getElementById('status').textContent = 'Error: not a secure context. Open via http://localhost:3000';
+    return;
+  }
 
   log('Sending GET /api/public-key to fetch the server\'s RSA-2048 public key (SPKI/PEM format)…');
   let pemKey;

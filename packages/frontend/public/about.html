@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>About — End-to-End Encryption Demo</title>
+  <style>
+    body { max-width: 800px; margin: 40px auto; padding: 0 16px; font-family: monospace; line-height: 1.6; color: #222; }
+    nav { margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid #ccc; }
+    nav a { margin-right: 16px; color: #0055aa; }
+    h1 { margin-bottom: 4px; }
+    h2 { margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+    h3 { margin-top: 24px; }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 0.95em; }
+    pre { background: #f5f5f5; border: 1px solid #ddd; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+    .diagram { background: #fafafa; border: 1px solid #ccc; padding: 16px; overflow-x: auto; font-size: 13px; line-height: 1.45; }
+    .note { background: #fff8e1; border-left: 3px solid #f9a825; padding: 10px 14px; margin: 16px 0; }
+    ul { padding-left: 24px; }
+    li { margin-bottom: 6px; }
+    .field-table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    .field-table th, .field-table td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; font-family: monospace; font-size: 13px; }
+    .field-table th { background: #f0f0f0; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a href="/">&#8592; Upload</a>
+  <a href="/about.html"><strong>About</strong></a>
+</nav>
+
+<h1>How This App Works</h1>
+<p>
+  This app lets you upload a file that is <strong>encrypted entirely in your browser</strong>
+  before it ever leaves your machine. The server can only decrypt it because it holds the
+  matching private key. No plaintext data is ever sent over the wire.
+</p>
+<p>
+  The technique is called <strong>hybrid encryption</strong> &mdash; the same pattern used
+  by TLS, PGP, and S/MIME.
+</p>
+
+<h2>The Two Layers</h2>
+
+<h3>Asymmetric layer: RSA-2048 / OAEP / SHA-256</h3>
+<p>
+  When the server starts, it generates an <strong>ephemeral RSA-2048 key pair</strong>.
+  The public key is served to browsers; the private key never leaves the server process.
+  Because the keys live only in memory, they are regenerated on every restart.
+</p>
+<ul>
+  <li><strong>Encoding:</strong> Public key &rarr; SPKI/PEM, Private key &rarr; PKCS#8/PEM</li>
+  <li><strong>Padding:</strong> RSA-OAEP (probabilistic, IND-CCA2 secure)</li>
+  <li><strong>OAEP hash:</strong> SHA-256</li>
+  <li><strong>Purpose:</strong> Encrypt the 32-byte AES session key so only the server can recover it</li>
+  <li><strong>Output size:</strong> Always 256 bytes (= modulus size &divide; 8)</li>
+</ul>
+
+<h3>Symmetric layer: AES-256-GCM</h3>
+<p>
+  RSA can only encrypt small payloads (&le;214 bytes for RSA-2048 with SHA-256 OAEP).
+  Instead, the file is encrypted with fast symmetric <strong>AES-256 in GCM mode</strong>,
+  and only the tiny AES key is RSA-encrypted.
+</p>
+<ul>
+  <li><strong>Key:</strong> 256 bits (32 bytes), randomly generated per upload</li>
+  <li><strong>IV / Nonce:</strong> 96 bits (12 bytes), randomly generated per upload (NIST recommendation for GCM)</li>
+  <li><strong>Auth tag:</strong> 128 bits (16 bytes), appended to the ciphertext by Web Crypto</li>
+  <li><strong>Properties:</strong> Authenticated encryption &mdash; provides both confidentiality <em>and</em> integrity</li>
+</ul>
+
+<h2>Step-by-Step Flow</h2>
+
+<h3>1. Key distribution</h3>
+<p>
+  On page load, the browser fetches the server's public key via <code>GET /api/public-key</code>,
+  strips the PEM headers, base64-decodes to raw SPKI DER bytes, and imports it into the
+  <strong>Web Crypto API</strong> as an RSA-OAEP encryption key.
+</p>
+
+<h3>2. File reading</h3>
+<p>
+  The user selects a file. The browser reads it into an <code>ArrayBuffer</code> using
+  the File API.
+</p>
+
+<h3>3. AES key + IV generation</h3>
+<p>
+  A fresh 256-bit AES-GCM key is generated via <code>crypto.subtle.generateKey</code>,
+  and a fresh 12-byte IV is generated via <code>crypto.getRandomValues</code>.
+  Both are cryptographically random and unique to this single upload.
+</p>
+
+<h3>4. File encryption (AES-256-GCM)</h3>
+<p>
+  The file bytes are encrypted with <code>crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuffer)</code>.
+  Web Crypto appends a 16-byte GCM authentication tag to the end of the ciphertext.
+  Any tampering with the ciphertext will cause decryption to fail on the server.
+</p>
+
+<h3>5. Key wrapping (RSA-OAEP)</h3>
+<p>
+  The AES key is exported to raw bytes, then encrypted with the server's RSA public key via
+  <code>crypto.subtle.encrypt({ name: "RSA-OAEP" }, rsaPublicKey, rawAesKey)</code>.
+  The 32-byte key becomes a fixed 256-byte RSA ciphertext. OAEP padding is probabilistic,
+  so encrypting the same key twice produces different ciphertexts.
+</p>
+
+<h3>6. Payload assembly &amp; upload</h3>
+<p>
+  All binary fields are base64-encoded and sent as a JSON POST to <code>/api/upload</code>:
+</p>
+<table class="field-table">
+  <tr><th>Field</th><th>Contents</th><th>Size</th></tr>
+  <tr><td><code>encryptedAesKey</code></td><td>RSA-OAEP ciphertext of the AES key</td><td>256 bytes</td></tr>
+  <tr><td><code>encryptedFile</code></td><td>AES-GCM ciphertext + 16-byte auth tag</td><td>file size + 16 bytes</td></tr>
+  <tr><td><code>iv</code></td><td>AES-GCM initialisation vector</td><td>12 bytes</td></tr>
+  <tr><td><code>filename</code></td><td>Original filename (plaintext)</td><td>varies</td></tr>
+</table>
+
+<h3>7. Server-side decryption</h3>
+<p>
+  The server reverses the process:
+</p>
+<ol>
+  <li>Base64-decode all fields</li>
+  <li>RSA-OAEP decrypt the AES key using the private key</li>
+  <li>Split the encrypted file buffer into ciphertext and the trailing 16-byte GCM auth tag
+      (Node.js requires the tag to be supplied separately via <code>setAuthTag()</code>)</li>
+  <li>AES-256-GCM decrypt the ciphertext, verifying the auth tag</li>
+  <li>Save the recovered plaintext to disk</li>
+</ol>
+
+<h2>Visual Summary</h2>
+<pre class="diagram">BROWSER                                          SERVER
+&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;                                           &#9472;&#9472;&#9472;&#9472;&#9472;&#9472;
+                                          Generate RSA-2048 key pair
+                                          (ephemeral, in-memory only)
+
+GET /api/public-key &#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9658;  Return public key (PEM)
+Import as RSA-OAEP/SHA-256 CryptoKey
+
+User selects a file
+Read file &#8594; ArrayBuffer
+Generate random AES-256 key (32 bytes)
+Generate random IV (12 bytes)
+AES-GCM encrypt(file) &#8594; ciphertext+tag
+RSA-OAEP encrypt(AES key) &#8594; 256 bytes
+Base64-encode everything
+
+POST /api/upload &#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9658;  RSA-OAEP decrypt &#8594; recover AES key
+                                          Split ciphertext / auth tag
+                                          AES-GCM decrypt &#8594; recover file
+                                          Save to uploads/
+                                     &#9668;&#9472;  { success, filename, bytes }</pre>
+
+<h2>Security Properties</h2>
+<ul>
+  <li><strong>No plaintext on the wire</strong> &mdash; only the RSA-encrypted AES key and
+      AES-GCM ciphertext are transmitted.</li>
+  <li><strong>Authenticated encryption</strong> &mdash; GCM provides both confidentiality and
+      integrity. Any tampering with the ciphertext is detected during <code>decipher.final()</code>.</li>
+  <li><strong>Fresh keys per upload</strong> &mdash; a new AES key and IV are generated for
+      every file. The RSA pair itself is regenerated on every server restart.</li>
+  <li><strong>No dependencies</strong> &mdash; the browser uses the built-in
+      <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API">Web Crypto API</a>;
+      the server uses Node.js's built-in <code>crypto</code> module. Zero third-party crypto libraries.</li>
+</ul>
+
+<h2>Trust Model &amp; Cloudflare</h2>
+<p>
+  This server is designed to run on your own hardware (e.g. a Raspberry Pi) and be exposed
+  to the internet through a <a href="https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/">Cloudflare Tunnel</a>.
+  Because files are encrypted before they leave your browser, Cloudflare only ever sees
+  ciphertext &mdash; they cannot read the file contents at rest.
+</p>
+<p>
+  However, <strong>you do need to trust Cloudflare not to actively attack the connection.</strong>
+  Here&rsquo;s why:
+</p>
+<ul>
+  <li>
+    <strong>Public key substitution.</strong> The browser fetches the server&rsquo;s RSA public key
+    over the same channel that Cloudflare proxies. An active MITM could swap the real public key
+    for their own, decrypt the AES session key in transit, re-encrypt it with the real key, and
+    forward it. Neither the sender nor the server would notice.
+  </li>
+  <li>
+    <strong>Code tampering.</strong> Cloudflare also serves the frontend HTML and JavaScript. In
+    theory, it could modify the encryption code itself &mdash; skip encryption, exfiltrate plaintext,
+    or insert a backdoor. This is the same fundamental limitation that applies to any browser-based
+    E2E encryption tool (Signal Web, WhatsApp Web, ProtonMail, etc.).
+  </li>
+</ul>
+
+<h3>What the encryption protects against</h3>
+<ul>
+  <li>Passive eavesdroppers anywhere on the network &mdash; they see only ciphertext</li>
+  <li>Cloudflare logging or storing request bodies at rest &mdash; the data is useless without the private key</li>
+  <li>Any casual or automated data collection by the proxy layer</li>
+</ul>
+
+<h3>What it does not protect against</h3>
+<ul>
+  <li>Cloudflare (or a Cloudflare compromise) actively choosing to MITM the key exchange</li>
+  <li>Cloudflare modifying the served JavaScript to bypass encryption</li>
+</ul>
+
+<p>
+  In practice, trusting Cloudflare is a reasonable tradeoff &mdash; they are a major infrastructure
+  provider with strong incentives not to tamper with customer traffic. But it is not the same
+  guarantee as true end-to-end encryption where both endpoints run locally-verified code.
+</p>
+
+<h2>Caveats</h2>
+<div class="note">
+  <strong>Filename is unencrypted.</strong> The original filename is sent as plaintext in the
+  JSON payload &mdash; it is the only piece of metadata that is not encrypted.
+</div>
+<div class="note">
+  <strong>~75 MB file limit.</strong> The Express JSON body parser is capped at 100 MB, and
+  base64 encoding adds ~33% overhead, giving a practical ceiling of roughly 75 MB per upload.
+</div>
+
+</body>
+</html>
