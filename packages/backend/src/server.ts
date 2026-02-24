@@ -156,6 +156,9 @@ app.post("/api/upload", (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`[server] Listening on http://localhost:${PORT}`);
+export const ready = new Promise<void>((resolve) => {
+  app.listen(PORT, () => {
+    console.log(`[server] Listening on http://localhost:${PORT}`);
+    resolve();
+  });
 });
